@@ -1,0 +1,233 @@
+---
+title: 'Multiple-Choice Online Causal Comprehension Assessment (MOCCA): Reimagining
+  Question Readability'
+author: "Anwesha Guha"
+date: "12/1/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(gtools)
+library(here)
+library(rio)
+
+require(recipes)
+require(caret)
+require(finalfit)
+require(glmnet)
+require(vip)
+require(kknn)
+```
+
+
+## Final
+
+```{r}
+mocca_features <- import(here("data", "mocca_features.csv"))
+mocca_data <- import(here("data", "mocca_data.csv"))
+readability_features <- read.csv("https://raw.githubusercontent.com/uo-datasci-specialization/c4-ml-fall-2021/main/data/readability_features.csv", header = TRUE)
+
+mocca <- mocca_data %>% 
+  select(-V1, -X1, -form_item, -storyid)
+
+mocca <- mocca %>% 
+  select(-c(2:11), -story) %>% 
+  select(flesch_kincaid, wl, meanSentenceLength, meanWordSyllables, everything())
+```
+
+Create recipe. This recipe
+
+* assigns the last column (target) as outcome and everything else as predictors,
+* removes any variable with zero variance or near-zero variance,
+* impute the missing values using the mean,
+* standardize all variables,
+* and removes variables highly correlated with one another (>.9)
+
+```{r}
+
+blueprint <- recipe(x     = mocca,
+                    vars  = colnames(mocca),
+                    roles = c("outcome", rep('predictor',780))) %>%
+  step_zv(all_numeric()) %>%
+  step_nzv(all_numeric()) %>%
+  step_impute_mean(all_numeric()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_corr(all_numeric(),threshold=0.9)
+```
+
+Modeling Approach #1
+```{r}
+mod <- lm(flesch_kincaid ~ 1 + dim1_p, data = mocca_features)
+summary(mod)
+```
+Train/Test Split
+```{r}
+set.seed(10152021)  # for reproducibility
+  
+loc      <- sample(1:nrow(mocca), round(nrow(mocca) * 0.8))
+mocca_tr  <- mocca[loc, ]
+mocca_te  <- mocca[-loc, ]
+```
+
+Prepare and Bake
+```{r}
+prepare <- prep(blueprint, 
+                training = mocca_tr)
+prepare
+```
+
+```{r}
+baked_tr <- bake(prepare, new_data = mocca_tr)
+
+baked_te <- bake(prepare, new_data = mocca_te)
+```
+
+Modeling Approach #1 - 10-fold cross validation with caret package, Linear Regression
+```{r}
+
+# Randomly shuffle the data
+
+mocca_tr = mocca_tr[sample(nrow(mocca_tr)),]
+
+# Create 10 folds with equal size
+
+folds = cut(seq(1,nrow(mocca_tr)),breaks=10,labels=FALSE)
+  
+# Create the list for each fold 
+      
+my.indices <- vector('list',10)
+      for(i in 1:10){
+        my.indices[[i]] <- which(folds!=i)
+      }
+      
+cv <- trainControl(method = "cv",
+                   index  = my.indices)
+
+# Train the model
+  
+  # note that I provide the blueprint and original unprocessed training dataset
+  # as input
+
+caret_mod <- caret::train(blueprint, 
+                          data      = mocca_tr, 
+                          method    = "lm", 
+                          trControl = cv)
+
+caret_mod
+```
+Apply blueprint to test data.
+```{r}
+predicted_te <- predict(caret_mod, mocca_te)
+
+rsq_te <- cor(mocca_te$flesch_kincaid,predicted_te)^2
+rsq_te
+```
+
+```{r}
+mae_te <- mean(abs(mocca_te$flesch_kincaid - predicted_te))
+mae_te
+```
+
+```{r}
+mse_te <- mean((mocca_te$flesch_kincaid - predicted_te)^2)
+mse_te
+```
+
+```{r}
+rmse_te <- sqrt(mean((mocca_te$flesch_kincaid - predicted_te)^2))
+rmse_te
+```
+
+
+Modeling Approach #2 - 10-fold cross validation, Linear Regression w. Ridge Penalty
+```{r}
+grid <- data.frame(alpha = 0, lambda = seq(0,3,.1)) 
+grid
+```
+
+```{r}
+ridge <- caret::train(blueprint, 
+                        data      = mocca_tr, 
+                        method    = "glmnet", 
+                        trControl = cv,
+                        tuneGrid  = grid)
+```
+
+```{r}
+ridge$results
+  
+plot(ridge)
+```
+All values are the same, no change.
+
+```{r}
+predict_te_ridge <- predict(ridge, mocca_te)
+
+rsq_te_ridge <- cor(mocca_te$flesch_kincaid, predict_te_ridge)^2
+rsq_te_ridge
+```
+```{r}
+mae_te_ridge <- mean(abs(mocca_te$flesch_kincaid - predict_te_ridge))
+mae_te_ridge
+```
+```{r}
+rmse_te_ridge <- sqrt(mean((mocca_te$flesch_kincaid - predict_te_ridge)^2))
+rmse_te_ridge
+```
+
+```{r}
+vip(ridge, num_features = 10, geom = "point") + 
+  theme_bw()
+```
+
+
+Modeling Approach #3 - 10-fold cross validation, Linear Regression w. Lasso Penalty
+```{r}
+grid2 <- data.frame(alpha = 1, lambda = seq(0,3,.1))
+
+lasso <- caret::train(blueprint, 
+                        data      = mocca_tr, 
+                        method    = "glmnet", 
+                        trControl = cv,
+                        tuneGrid  = grid2)
+
+lasso$results
+plot(lasso)
+```
+```{r}
+grid3 <- data.frame(alpha = 1, lambda = seq(0,.2,.001))
+
+lasso2 <- caret::train(blueprint, 
+                        data      = mocca_tr, 
+                        method    = "glmnet", 
+                        trControl = cv,
+                        tuneGrid  = grid3)
+
+lasso2$bestTune
+plot(lasso2)
+```
+
+```{r}
+predict_te_lasso<- predict(lasso2, mocca_te)
+
+rsq_te_lasso <- cor(mocca_te$flesch_kincaid, predict_te_lasso)^2
+rsq_te_lasso
+```
+
+```{r}
+mae_te_lasso <- mean(abs(mocca_te$flesch_kincaid - predict_te_lasso))
+mae_te_lasso
+```
+
+```{r}
+rmse_te_lasso <- sqrt(mean((mocca_te$flesch_kincaid - predict_te_lasso)^2))
+rmse_te_lasso
+```
+Variable importance
+```{r}
+vip(lasso2, num_features = 10, geom = "point") + 
+  theme_bw()
+```
+
